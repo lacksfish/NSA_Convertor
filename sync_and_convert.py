@@ -19,7 +19,11 @@ from typing import List, Dict, Optional
 # Import conversion function from our converter
 from nsa_convertor import nsa_to_pdf
 
+from dotenv import load_dotenv
 
+load_dotenv()
+
+DEFAULT_PATH = os.getenv("DEFAULT_PATH", r"./output")
 class CloudSyncManager:
     """Base class for cloud storage sync managers"""
     
@@ -53,10 +57,13 @@ class CloudSyncManager:
                 hash_md5.update(chunk)
         return hash_md5.hexdigest()
     
-    def _needs_conversion(self, nsa_file: Path) -> bool:
+    def _needs_conversion(self, nsa_file: Path, pdf_path: Optional[Path] = None) -> bool:
         """Check if NSA file needs conversion"""
         file_key = str(nsa_file)
-        pdf_file = self.output_dir / (nsa_file.stem + ".pdf")
+        if pdf_path is None:
+            pdf_file = self.output_dir / (nsa_file.stem + ".pdf")
+        else:
+            pdf_file = pdf_path
         
         # Convert if PDF doesn't exist
         if not pdf_file.exists():
@@ -68,10 +75,16 @@ class CloudSyncManager:
         
         return current_hash != stored_hash
     
-    def convert_file(self, nsa_file: Path, verbose: bool = True) -> bool:
+    def convert_file(self, nsa_file: Path, pdf_path: Optional[Path] = None, verbose: bool = True) -> bool:
         """Convert single NSA file to PDF"""
         try:
-            pdf_file = self.output_dir / (nsa_file.stem + ".pdf")
+            if pdf_path is None:
+                pdf_file = self.output_dir / (nsa_file.stem + ".pdf")
+            else:
+                pdf_file = pdf_path
+            
+            # Create parent directory if it doesn't exist
+            pdf_file.parent.mkdir(parents=True, exist_ok=True)
             
             if verbose:
                 print(f"Converting: {nsa_file.name}")
@@ -87,7 +100,12 @@ class CloudSyncManager:
             )
             
             if verbose:
-                print(f"  ✓ Saved to: {pdf_file.name}")
+                # Show relative path from output_dir
+                try:
+                    rel_path = pdf_file.relative_to(self.output_dir)
+                    print(f"  ✓ Saved to: {rel_path}")
+                except ValueError:
+                    print(f"  ✓ Saved to: {pdf_file.name}")
             
             # Update state
             file_key = str(nsa_file)
@@ -132,6 +150,7 @@ class GoogleDriveSync(CloudSyncManager):
         self.folder_id = folder_id
         self.recursive = recursive
         self.service = None
+        self.file_metadata = {}  # Track folder paths for each file
     
     def authenticate(self):
         """Authenticate with Google Drive API"""
@@ -173,9 +192,11 @@ class GoogleDriveSync(CloudSyncManager):
             print(f"Authentication error: {e}")
             return False
     
-    def _get_all_folders_recursive(self, parent_id: str) -> List[str]:
-        """Get all folder IDs recursively under a parent folder"""
-        folder_ids = [parent_id]
+    def _get_all_folders_recursive(self, parent_id: str, parent_path: str = "") -> Dict[str, str]:
+        """Get all folder IDs recursively under a parent folder with their paths
+        Returns: Dict mapping folder_id to folder_path
+        """
+        folder_map = {parent_id: parent_path}
         
         # Get subfolders
         query = f"'{parent_id}' in parents and mimeType = 'application/vnd.google-apps.folder'"
@@ -188,9 +209,11 @@ class GoogleDriveSync(CloudSyncManager):
         
         # Recursively get subfolders
         for folder in subfolders:
-            folder_ids.extend(self._get_all_folders_recursive(folder['id']))
+            folder_path = os.path.join(parent_path, folder['name']) if parent_path else folder['name']
+            subfolder_map = self._get_all_folders_recursive(folder['id'], folder_path)
+            folder_map.update(subfolder_map)
         
-        return folder_ids
+        return folder_map
     
     def download_files(self, verbose: bool = True) -> int:
         """Download .nsa files from Google Drive"""
@@ -203,20 +226,21 @@ class GoogleDriveSync(CloudSyncManager):
             import io
             
             # Get all folder IDs to search (recursive or single)
-            folder_ids = []
+            folder_map = {}  # Maps folder_id to folder_path
             if self.folder_id:
                 if self.recursive:
                     if verbose:
                         print(f"Searching folder and all subfolders...")
-                    folder_ids = self._get_all_folders_recursive(self.folder_id)
+                    folder_map = self._get_all_folders_recursive(self.folder_id)
                     if verbose:
-                        print(f"Found {len(folder_ids)} folders to search")
+                        print(f"Found {len(folder_map)} folders to search")
                 else:
-                    folder_ids = [self.folder_id]
+                    folder_map = {self.folder_id: ""}
             
             # Query for .nsa files
-            if folder_ids:
+            if folder_map:
                 # Build query for multiple folders
+                folder_ids = list(folder_map.keys())
                 folder_queries = [f"'{fid}' in parents" for fid in folder_ids]
                 query = f"({' or '.join(folder_queries)}) and name contains '.nsa' and mimeType != 'application/vnd.google-apps.folder'"
             else:
@@ -224,7 +248,7 @@ class GoogleDriveSync(CloudSyncManager):
             
             results = self.service.files().list(
                 q=query,
-                fields="files(id, name, modifiedTime)",
+                fields="files(id, name, modifiedTime, parents)",
                 pageSize=1000
             ).execute()
             
@@ -236,6 +260,18 @@ class GoogleDriveSync(CloudSyncManager):
             
             for file in files:
                 local_path = self.local_dir / file['name']
+                
+                # Determine folder path for this file
+                folder_path = ""
+                if 'parents' in file and file['parents']:
+                    parent_id = file['parents'][0]  # Use first parent
+                    folder_path = folder_map.get(parent_id, "")
+                
+                # Store metadata for later conversion
+                self.file_metadata[file['name']] = {
+                    'folder_path': folder_path,
+                    'file_id': file['id']
+                }
                 
                 # Download file
                 request = self.service.files().get_media(fileId=file['id'])
@@ -258,7 +294,33 @@ class GoogleDriveSync(CloudSyncManager):
     def sync(self, verbose: bool = True) -> tuple[int, int]:
         """Download and convert files"""
         downloaded = self.download_files(verbose)
-        converted = self.sync_local_files(verbose)
+        
+        # Convert files with folder structure
+        converted = 0
+        nsa_files = list(self.local_dir.glob("*.nsa"))
+        
+        if verbose:
+            print(f"Found {len(nsa_files)} .nsa files to process")
+        
+        for nsa_file in nsa_files:
+            # Get folder path from metadata
+            metadata = self.file_metadata.get(nsa_file.name, {})
+            folder_path = metadata.get('folder_path', '')
+            
+            # Construct PDF output path with folder structure
+            if folder_path:
+                pdf_path = self.output_dir / folder_path / (nsa_file.stem + ".pdf")
+            else:
+                pdf_path = self.output_dir / (nsa_file.stem + ".pdf")
+            
+            # Check if conversion is needed
+            if self._needs_conversion(nsa_file, pdf_path):
+                if self.convert_file(nsa_file, pdf_path, verbose):
+                    converted += 1
+        
+        self.state["last_sync"] = datetime.now().isoformat()
+        self._save_state()
+        
         return downloaded, converted
 
 
@@ -279,7 +341,7 @@ def main():
     )
     parser.add_argument(
         "--output-dir",
-        default="./pdf_output",
+        default=DEFAULT_PATH,
         help="Output directory for PDFs"
     )
     parser.add_argument(
